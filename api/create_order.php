@@ -139,7 +139,7 @@ try {
             "items"=>$items
           );
 
-          var_dump(json_encode($shipments, true));
+          //var_dump(json_encode($shipments, true));
         
 
           $receiver=array("first_name"=>$data["customer"]["default_address"]["first_name"],
@@ -150,7 +150,7 @@ try {
                           "document"=>"NO INFORMA",
                           "address"=>$address);
 
-        var_dump(json_encode($receiver, true));
+        //var_dump(json_encode($receiver, true));
           // Armado Final de Json de creacion de Orden
 
           $orden["order_id"]=$idorden;
@@ -173,7 +173,7 @@ try {
     //Con los datos de API creo el token 
     $token = tokenapi($UsuarioAPI,$ClaveAPI);
         
-    //var_dump($token);
+    var_dump($token);
 
     $CrearOrden = OrderCreateapi($token,$ORDjson);
 

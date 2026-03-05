@@ -36,6 +36,8 @@ if($_SERVER['request_method'] == 'POST' or true )
     file_put_contents($fichero ."-" .$company .".log", json_encode($fechalog."-" .json_encode($infoin, true), true) ."\n",  FILE_APPEND | LOCK_EX);}
 
     $valor ="'%$company%'";
+
+    //var_dump($valor);
     // Busco en base de datos el usuario y clave de API con el nombre de la compania
     $consulta = $pdo->prepare("SELECT `usr-wms`, `psw-wms` FROM `sf_stores` WHERE `usr-store` like $valor ");
     $consulta->execute();
@@ -71,6 +73,7 @@ if($_SERVER['request_method'] == 'POST' or true )
 
     $cotizado = rateapi($token,$COTjson);
 
+    var_dump($cotizado);
    
     // Con los datos recibidos de API armo el array de respuesta a SF
 

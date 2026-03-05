@@ -1,172 +1,259 @@
 <?php
-error_reporting(E_ALL & ~E_WARNING);
+
+
+declare(strict_types=1);
+
+error_reporting(E_ALL);
 
 require '../vendor/autoload.php';
 require '../db/cnx.php';
 require 'funtions.php';
 
+
 use Dotenv\Dotenv;
 
+/* ================================
+   CARGA DE VARIABLES DE ENTORNO
+================================ */
 $dotenv = Dotenv::createImmutable(__DIR__);
 $dotenv->load();
 
-$shop = $_GET['shop'] ?? '';
-$code = $_GET['code'] ?? '';
-$dotenv->load();
+$apiKey    = $_ENV['SHOPIFY_API_KEY'];
+$apiSecret = $_ENV['SHOPIFY_API_SECRET'];
 
-$url_store = $shop;
-if (!$shop || !$code) {
-    die("Parámetros inválidos.");
-} 
+/* ================================
+   VALIDACIÓN BÁSICA DE PARÁMETROS
+================================ */
+$params = $_GET;
+
+if (!isset($params['shop'], $params['code'], $params['hmac'], $params['state'])) {
+    http_response_code(400);
+    exit('Missing required parameters.');
+}
+
+$shop  = $params['shop'];
+$code  = $params['code'];
+$hmac  = $params['hmac'];
+$state = $params['state'];
+
+/* ================================
+   VALIDAR STATE (ANTI-CSRF)
+================================ */
+//session_start();
+
+if ($_ENV['APP_ENV'] !== 'local') {
+    if (!isset($_SESSION['shopify_state']) || $state !== $_SESSION['shopify_state']) {
+        http_response_code(403);
+        exit('Invalido state.');
+    }
+}
 
 
-$access_token_url = "https://{$url_store}/admin/oauth/access_token";
+/* ================================
+   VALIDAR HMAC (SEGURIDAD CRÍTICA)
+================================ */
+unset($params['hmac']);
 
-$response = file_get_contents($access_token_url, false, stream_context_create([
-    'http' => [
-        'method'  => 'POST',
-        'header'  => "Content-Type: application/json",
-        'content' => json_encode([
-            'client_id'     => $_ENV['SHOPIFY_API_KEY'],
-            'client_secret' => $_ENV['SHOPIFY_API_SECRET'],
-            'code'          => $code,
-        ])
-    ]
-]));
+ksort($params);
+
+$queryString = http_build_query($params);
+
+$calculatedHmac = hash_hmac('sha256', $queryString, $apiSecret);
+
+if (!hash_equals($hmac, $calculatedHmac)) {
+    http_response_code(403);
+    exit('Invalid HMAC.');
+}
+
+/* ================================
+   INTERCAMBIAR CODE POR TOKEN
+================================ */
+$tokenUrl = "https://{$shop}/admin/oauth/access_token";
+
+$ch = curl_init($tokenUrl);
+
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => json_encode([
+        'client_id'     => $apiKey,
+        'client_secret' => $apiSecret,
+        'code'          => $code
+    ]),
+    CURLOPT_HTTPHEADER => [
+        'Content-Type: application/json'
+    ],
+]);
+
+$response = curl_exec($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+if ($response === false || $httpCode !== 200) {
+    http_response_code(500);
+    exit('Failed to retrieve access token.');
+}
+
+curl_close($ch);
 
 $data = json_decode($response, true);
 
+if (!isset($data['access_token'])) {
+    http_response_code(500);
+    exit('Access token not found.');
+}
+
+$accessToken = $data['access_token'];
+
+/* ================================
+   GUARDAR TOKEN EN BASE DE DATOS
+================================ */
+try {
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+    $stmt = $pdo->prepare("
+        UPDATE sf_dash.sf_stores
+        SET `token-store` = :token,
+            `updated` = NOW()
+        WHERE `url-store` = :shop
+    ");
+
+    $stmt->execute([
+        ':token' => $accessToken,
+        ':shop'  => $shop
+    ]);
+
+} catch (PDOException $e) {
+    http_response_code(500);
+    exit('Database error.');
+}
+
+/* ================================
+   REGISTRAR WEBHOOK app/uninstalled
+================================ */
+$webhookData = [
+    "webhook" => [
+        "topic"   => "app/uninstalled",
+        "address" => $_ENV['SHOPIFY_UNINSTALL_WEBHOOK'],
+        "format"  => "json"
+    ]
+];
+
+$ch1 = curl_init("https://{$shop}/admin/api/2026-01/webhooks.json");
+
+curl_setopt_array($ch1, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => json_encode($webhookData),
+    CURLOPT_HTTPHEADER => [
+        "Content-Type: application/json",
+        
+        "X-Shopify-Access-Token: {$accessToken}"
+    ],
+]);
+
+//curl_exec($ch1);
+$response1 = curl_exec($ch1);
+curl_close($ch1);
+
+
 
 try {
-    $insertedId = insertlogs($pdo, 'sf_logs', $data);
+    $insertedId = insertlogs($pdo, 'sf_logs', json_decode($response1) );
+    
 }
 catch (PDOException $e) {
     echo "Error de conexión: " . $e->getMessage();
-    //echo "\n-------------------------\n";
+     echo "\n-------------------------\n";
 }
 
-$access_token = $data['access_token'] ?? '';
 
 
-if (!$access_token) {
-    die("No se pudo obtener el token de acceso.");
-    //echo "\n-------------------------\n";
-}
-
-            else{
-
-
-            // Configurar el modo de error de PDO para excepciones
-            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-            $fechaHoraActual = date('Y-m-d H:i:s');
-
-            $query = "UPDATE sf_dash.sf_stores 
-                    SET `token-store` = :token_store, 
-                        `updated` = :updated 
-                    WHERE `url-store` = :url_store";
-
-            $stmt = $pdo->prepare($query);
-
-            // Enlazar parámetros correctamente
-            $stmt->bindParam(':token_store', $access_token, PDO::PARAM_STR);
-            $stmt->bindParam(':updated', $fechaHoraActual, PDO::PARAM_STR);
-            $stmt->bindParam(':url_store', $url_store, PDO::PARAM_STR);
-
-            // Ejecutar la consulta
-            $stmt->execute();
-           
-            file_put_contents("../tokens/{$shop}.txt", $access_token);
-/************************INICIO LA CREACION DEL SERVICIO DE CARRIER ***************************** */
-
-$url = "https://{$shop}/admin/api/2024-07/carrier_services.json";
-$psdurl = $_ENV['SHOPIFY_RATE_URL'];
-$psdurl = "https://rate.requestcatcher.com/";  //uRL donde va a ir a buscar cotizaciones posteriormente
-
-//var_dump($psdurl);
-
-$data = [
+/* ================================
+   CREAR EL SERVICIO DE CARRIER
+================================ */
+$webhookData = [
     "carrier_service" => [
-        //"id"                    => 1036894980,
-        "name"                  => "IFLOW S.A.",
-        "callback_url"          => $psdurl,
+        // "id"                    => 1036894980,
+        "name"                  => "iFLOW eCOMMERCE S.A.",
+        "callback_url"          =>  $_ENV['SHOPIFY_RATE_URL'],
         "carrier_service_type"  => "api",
         //"admin_graphql_api_id"  => "gid://shopify/DeliveryCarrierService/1036894980",
         "service_discovery"     => true,
-        "format"                => "json"
-    ]
+        "format"                => "json" ]
+		
 ];
 
-//var_dump($data); exit;
-/****************************************** */
-$ch = curl_init($url);
+$ch2 = curl_init("https://{$shop}/admin/api/2026-01/carrier_services.json");
 
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_POST, true);
-curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    "X-Shopify-Shop-Domain: $shop",
-    "Content-Type: application/json",
-    "X-Shopify-Access-Token: $access_token",
-    "X-Shopify-API-Version: 2024-07",
+curl_setopt_array($ch2, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => json_encode($webhookData),
+    CURLOPT_HTTPHEADER => [
+        "Content-Type: application/json",
+        "X-Shopify-Access-Token: {$accessToken}"
+    ],
 ]);
 
-$response = curl_exec($ch);
-
-curl_close($ch);
-
-
-/******************************************** */
-
-
-$data_sc = json_decode($response, true);
-
-
-var_dump($data_sc); // veo la respuesta de la ejecucion del post 
+//curl_exec($ch2);
+ $response2 = curl_exec($ch2);
+curl_close($ch2);
 
 
 try {
-    $insertedId = insertlogs($pdo,'sf_logs', $data_sc);
+    $insertedId = insertlogs($pdo, 'sf_logs', json_decode($response2) );
 }
 catch (PDOException $e) {
     echo "Error de conexión: " . $e->getMessage();
-   
+    //echo "\n-------------------------\n";
 }
 
 
-$carrier_id = $data_sc["carrier_service"]["id"];
-
-$webhookUrl = $_ENV['SHOPIFY_HOOK_URL']; // url de la creacion de la orden 
-
-$data = [
-    "webhook" => [
-        "topic" => "orders/paid",  // la debe enviar cuando la orden este paga
-        "address" => $webhookUrl,
-        "format" => "json"
-    ]
+/* ================================
+   WEBHOOK DE CREACION DE ORDEN
+================================ */
+$webhookData = [
+        "webhook" => [
+            "topics" => "orders/updated",  // la debe enviar cuando la orden este paga
+            "address" => $_ENV['SHOPIFY_HOOK_URL'],
+            "format" => "json" ]
+		
 ];
 
-$ch = curl_init("https://$shop/admin/api/2024-07/webhooks.json");
+$ch3 = curl_init("https://$shop/admin/api/2026-01/webhooks.json");
 
-curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_POST, true);
-curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    "Content-Type: application/json",
-    "X-Shopify-Access-Token: $access_token"
-]);
+curl_setopt_array($ch3, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => json_encode($webhookData),
+    CURLOPT_HTTPHEADER => [
+        "Content-Type: application/json",
+        "X-Shopify-Access-Token: {$access_token}"],
+        
+     ]);
 
-$response = curl_exec($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);  // Deberia capturar el codigo de respuesta del post 
-                                                    // se podria cambiar por guardar la respuesta completa en el log
-$insertedId = insertlogs($pdo,'sf_logs', json_encode($response, true));
+//curl_exec($ch2);
+ $response3 = curl_exec($ch3);
+curl_close($ch3);
 
 
+try {
+    $insertedId = insertlogs($pdo, 'sf_logs', json_decode($response3) );
+}
+catch (PDOException $e) {
+    echo "Error de conexión: " . $e->getMessage();
+    //echo "\n-------------------------\n";
 }
 
-curl_close($ch);
-    
 
-    
+/* ================================
+   LIMPIAR SESSION STATE
+================================ */
+unset($_SESSION['shopify_state']);
 
-?>
+/* ================================
+   REDIRIGIR A DASHBOARD
+================================ */
+header("Location: ../dashboard.php?shop={$shop}");
+
+exit;
